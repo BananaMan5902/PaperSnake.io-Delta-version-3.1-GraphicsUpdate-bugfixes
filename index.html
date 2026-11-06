@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>Paper Snake</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#14161f;color:#fff;
+    font-family:"Trebuchet MS","Segoe UI",sans-serif;touch-action:none;user-select:none}
+  canvas{display:block}
+  #hud{position:fixed;top:12px;left:14px;text-shadow:0 1px 4px #000;pointer-events:none}
+  #pct{font-size:34px;font-weight:800;letter-spacing:-.5px}
+  #sub{font-size:14px;opacity:.8}
+  #bar{width:150px;height:8px;background:rgba(255,255,255,.15);border-radius:4px;margin-top:8px;overflow:hidden}
+  #bar i{display:block;height:100%;width:100%;background:#ffd23f;border-radius:4px}
+  #lb{position:fixed;left:14px;bottom:14px;font-size:14px;line-height:1.5;text-shadow:0 1px 3px #000;pointer-events:none}
+  #lb b{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px}
+  #bst{position:fixed;right:16px;bottom:16px;width:76px;height:76px;border-radius:50%;border:3px solid #ffd23f;
+    background:rgba(255,210,63,.18);color:#ffd23f;font-weight:800;display:none}
+  @media (pointer:coarse){#bst{display:block}}
+  #ov{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(10,12,20,.82)}
+  #ov div{max-width:380px;padding:28px;text-align:center}
+  h1{margin:0 0 6px;font-size:46px;letter-spacing:-1px}
+  #msg{margin:0 0 14px;font-size:18px;min-height:24px}
+  p.how{font-size:14px;line-height:1.55;opacity:.85;margin:0 0 20px}
+  button#go{font:inherit;font-weight:800;font-size:18px;padding:12px 34px;border:0;border-radius:10px;
+    background:#7cf29a;color:#0c1a10;cursor:pointer}
+  button#go:focus-visible{outline:3px solid #fff;outline-offset:3px}
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<div id="hud"><div id="pct">0%</div><div id="sub"></div><div id="bar"><i id="en"></i></div></div>
+<div id="lb"></div>
+<button id="bst">BOOST</button>
+<div id="ov"><div>
+  <h1>Paper Snake</h1>
+  <p id="msg">Own 100% of the map.</p>
+  <p class="how">Leave your land to draw a tail, then loop back home to claim everything inside the loop.
+  Your dotted trail is harmless, it only marks the loop you are claiming. Crash your head into another snake's body and you die, so make them hit yours. Eat orbs to grow longer and thicker. Walls just stop you.<br><br>
+  <b>Move the mouse</b> (or drag a finger) to steer, or use <b>A / D / arrow keys</b>. Hold <b>Space</b> or click to boost.</p>
+  <button id="go">Play</button>
+</div></div>
+
+<script>
+// ---------- config ----------
+const W = 120, H = 120, N = W * H;      // map size in cells
+const S = 22;                            // cell size in px
+const BOTS = 14;
+const SPEED = 6, BOOST = 11;             // cells per second
+const NAMES = ['Slinky','Noodle','Viper','Mamba','Cobra','Adder','Rattler','Python','Sidewinder','Boa','Taipan','Anaconda','Asp','Krait','Copperhead','Garter'];
+const DIRS = [[1,0],[0,1],[-1,0],[0,-1]];
+
+// ---------- state ----------
+const owner = new Uint8Array(N);         // 0 = empty, else player id
+const trailG = new Uint8Array(N);        // 0 = no tail, else id of tail owner
+let players = [], me = null, state = 'menu', boosting = false;
+let counts = [], frame = 0, last = 0;
+const cam = { x: W / 2, y: H / 2 };
+const rnd = n => Math.floor(Math.random() * n);
+
+const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+const mini = document.createElement('canvas'); mini.width = W; mini.height = H;
+const mctx = mini.getContext('2d');
+let vw = 0, vh = 0, dpr = 1;
+function resize() {
+  dpr = window.devicePixelRatio || 1; vw = innerWidth; vh = innerHeight;
+  cv.width = vw * dpr; cv.height = vh * dpr;
+}
+addEventListener('resize', resize); resize();
+
+// ---------- players ----------
+const orbs = [], ORBS = 300;
+function addOrb(x, y, v) {
+  orbs.push({ x: Math.max(.5, Math.min(W - .5, x)), y: Math.max(.5, Math.min(H - .5, y)), v, h: rnd(360) });
+}
+function fillOrbs() { while (orbs.length < ORBS) addOrb(Math.random() * W, Math.random() * H, 1); }
+function dropOrbs(p) {                    // a dead snake turns into orbs along its body
+  for (let i = 0; i < p.hist.length; i += 3)
+    addOrb(p.hist[i][0] + (Math.random() - .5) * .6, p.hist[i][1] + (Math.random() - .5) * .6, 2);
+  addOrb(p.x, p.y, 3);
+}
+const OMEGA = 4;                          // max turn rate (rad/s) -> smooth, slither-style turning
+const wrap = a => Math.atan2(Math.sin(a), Math.cos(a));
+
+function makePlayer(id) {
+  const h = (id * 137.5) % 360;
+  return { id, human: id === 1, name: id === 1 ? 'You' : NAMES[id % NAMES.length],
+    fill: `hsla(${h},70%,55%,.7)`, solid: `hsl(${h},75%,58%)`, line: `hsl(${h},85%,45%)`,
+    alive: false, x: 0, y: 0, a: 0, target: 0, rate: OMEGA, trail: [], tcells: [], hist: [],
+    energy: 1, respawn: 0, mode: 'out', len: 40, curv: 1, think: 0, home: [0, 0], kills: 0, score: 0, size: 1 };
+}
+
+function spawn(p) {
+  for (let t = 0; t < 300; t++) {
+    const x = 4 + rnd(W - 8), y = 4 + rnd(H - 8);
+    let ok = true;
+    for (let j = -2; j <= 2 && ok; j++) for (let i = -2; i <= 2; i++) {
+      const c = (y + j) * W + x + i;
+      if (owner[c] || trailG[c]) { ok = false; break; }
+    }
+    if (!ok) continue;
+    for (let j = -1; j <= 1; j++) for (let i = -1; i <= 1; i++) owner[(y + j) * W + x + i] = p.id;
+    const a = Math.random() * Math.PI * 2, hist = [];
+    for (let i = 15; i >= 1; i--) hist.push([x + .5 - Math.cos(a) * 0.2 * i, y + .5 - Math.sin(a) * 0.2 * i]);
+    Object.assign(p, { alive: true, x: x + .5, y: y + .5, a, target: a, rate: OMEGA, trail: [], tcells: [], hist,
+      energy: 1, score: 0, size: 1, mode: 'out', len: 30 + rnd(50), curv: (Math.random() < .5 ? -1 : 1) * (.5 + Math.random() * .9),
+      think: 0, home: [x + .5, y + .5] });
+    return true;
+  }
+  return false;
+}
+
+function clearTrail(p) {
+  for (const c of p.tcells) if (trailG[c] === p.id) trailG[c] = 0;
+  p.trail = []; p.tcells = [];
+}
+
+function kill(p) {
+  if (!p.alive) return;
+  p.alive = false;
+  dropOrbs(p);
+  clearTrail(p);
+  for (let i = 0; i < N; i++) if (owner[i] === p.id) owner[i] = 0;
+  p.respawn = 4;
+  if (p.human) endGame(false);
+}
+
+// ---------- territory capture: claim the tail, then flood fill from the border ----------
+function capture(p) {
+  let pc = null;
+  for (const [tx, ty] of p.trail) {
+    const cx = tx | 0, cy = ty | 0;
+    if (pc && cx !== pc[0] && cy !== pc[1]) owner[pc[1] * W + cx] = p.id;   // close diagonal gaps
+    owner[cy * W + cx] = p.id; pc = [cx, cy];
+  }
+  clearTrail(p);
+  const seen = new Uint8Array(N), st = [];
+  const push = c => { if (!seen[c] && owner[c] !== p.id) { seen[c] = 1; st.push(c); } };
+  for (let x = 0; x < W; x++) { push(x); push((H - 1) * W + x); }
+  for (let y = 0; y < H; y++) { push(y * W); push(y * W + W - 1); }
+  while (st.length) {
+    const c = st.pop(), x = c % W;
+    if (x > 0) push(c - 1);
+    if (x < W - 1) push(c + 1);
+    if (c >= W) push(c - W);
+    if (c < N - W) push(c + W);
+  }
+  for (let i = 0; i < N; i++) if (!seen[i]) owner[i] = p.id;
+}
+
+// ---------- bot brain: picks a target angle, the body turns smoothly toward it ----------
+function danger(p, x, y) {
+  if (x < 1 || y < 1 || x >= W - 1 || y >= H - 1) return true;
+  for (const q of players) {                                 // other snakes' heads and bodies
+    if (q === p || !q.alive) continue;
+    const r = 0.9 + 0.5 * q.size, r2 = r * r;
+    if ((q.x - x) ** 2 + (q.y - y) ** 2 < r2) return true;
+    for (let i = 0; i < q.hist.length; i += 3) {
+      const t = q.hist[i]; if ((t[0] - x) ** 2 + (t[1] - y) ** 2 < r2) return true;
+    }
+  }
+  return false;
+}
+function ai(p, dt) {
+  p.think -= dt; if (p.think > 0) return; p.think = 0.1;
+  if (owner[(p.y | 0) * W + (p.x | 0)] === p.id) {
+    p.home = [p.x, p.y];
+    if (p.mode === 'home') { p.mode = 'out'; p.len = 30 + rnd(60); p.curv = (Math.random() < .5 ? -1 : 1) * (.5 + Math.random() * .9); }
+  }
+  if (p.mode === 'out' && p.trail.length > p.len) p.mode = 'home';
+  if (p.mode === 'home' && owner[(p.home[1] | 0) * W + (p.home[0] | 0)] !== p.id) {   // home land lost
+    let bd = 1e9;
+    for (let i = 0; i < N; i += 3) if (owner[i] === p.id) {
+      const d = (i % W - p.x) ** 2 + ((i / W | 0) - p.y) ** 2;
+      if (d < bd) { bd = d; p.home = [i % W + .5, (i / W | 0) + .5]; }
+    }
+    if (bd === 1e9) p.mode = 'out';
+  }
+  if (p.mode === 'out') { p.target = p.a + Math.sign(p.curv); p.rate = Math.abs(p.curv); }   // gentle arc
+  else { p.target = Math.atan2(p.home[1] - p.y, p.home[0] - p.x); p.rate = OMEGA; }
+  let bd = 100, bt = null;                                   // cut in front of the nearest enemy head
+  if (p.mode === 'out') for (const q of players) if (q !== p && q.alive) {
+    const d = (q.x - p.x) ** 2 + (q.y - p.y) ** 2;
+    if (d < bd && Math.abs(wrap(Math.atan2(q.y - p.y, q.x - p.x) - p.a)) < 1.2) {
+      bd = d; bt = [q.x + Math.cos(q.a) * 4, q.y + Math.sin(q.a) * 4];
+    }
+  }
+  if (bt) { p.target = Math.atan2(bt[1] - p.y, bt[0] - p.x); p.rate = OMEGA; }
+  else if (p.mode === 'out') {                               // otherwise grab nearby orbs
+    let od = 49, ob = null;
+    for (const o of orbs) { const d = (o.x - p.x) ** 2 + (o.y - p.y) ** 2; if (d < od) { od = d; ob = o; } }
+    if (ob) { p.target = Math.atan2(ob.y - p.y, ob.x - p.x); p.rate = OMEGA; }
+  }
+  const probe = o => danger(p, p.x + Math.cos(p.a + o) * 2.4, p.y + Math.sin(p.a + o) * 2.4);
+  if (probe(0) || probe(-.5) || probe(.5)) {                 // avoid walls and our own tail
+    const l = probe(-.8), r = probe(.8);
+    p.target = l && !r ? p.a + 1.2 : r && !l ? p.a - 1.2 : Math.atan2(H / 2 - p.y, W / 2 - p.x);
+    p.rate = OMEGA;
+  }
+}
+
+// ---------- movement: continuous, a small sub-step at a time ----------
+function advance(p, h, sp) {
+  const d = wrap(p.target - p.a), m = p.rate * h;
+  p.a += Math.max(-m, Math.min(m, d));
+  const ox = p.x, oy = p.y;
+  p.x += Math.cos(p.a) * sp * h; p.y += Math.sin(p.a) * sp * h;
+  p.x = Math.max(0.05, Math.min(W - 0.05, p.x)); p.y = Math.max(0.05, Math.min(H - 0.05, p.y));   // walls stop you
+  const inOwn = owner[(p.y | 0) * W + (p.x | 0)] === p.id;
+  if (inOwn) { if (p.trail.length) capture(p); }
+  else {
+    if (!p.trail.length) p.trail.push([ox, oy]);
+    const l = p.trail[p.trail.length - 1];
+    if ((p.x - l[0]) ** 2 + (p.y - l[1]) ** 2 >= 0.09) {
+      p.trail.push([p.x, p.y]);
+      const c = (p.y | 0) * W + (p.x | 0);
+      if (trailG[c] !== p.id) { trailG[c] = p.id; p.tcells.push(c); }
+    }
+  }
+  const lh = p.hist[p.hist.length - 1];                      // grow the physical body
+  if (!lh || (p.x - lh[0]) ** 2 + (p.y - lh[1]) ** 2 >= 0.04) {
+    p.hist.push([p.x, p.y]);
+    const mx = Math.ceil(Math.min(40, 3 + p.score * 0.25) / 0.2);
+    while (p.hist.length > mx) p.hist.shift();
+  }
+  for (const q of players) {                                 // head into another snake's body kills YOU
+    if (q === p || !q.alive) continue;
+    const r = 0.4 * p.size + 0.4 * q.size, r2 = r * r;
+    for (let i = 0; i < q.hist.length; i += 2) {
+      const dx = q.hist[i][0] - p.x, dy = q.hist[i][1] - p.y;
+      if (dx * dx + dy * dy < r2) { q.kills++; kill(p); return; }
+    }
+  }
+  for (let i = orbs.length - 1; i >= 0; i--) {               // eat orbs -> grow
+    const o = orbs[i], dx = o.x - p.x, dy = o.y - p.y, r = 0.9 * p.size;
+    if (dx * dx + dy * dy < r * r) { p.score += o.v; p.size = Math.min(2.4, 1 + p.score * 0.03); orbs.splice(i, 1); }
+  }
+}
+
+function update(dt) {
+  if (orbs.length > 800) orbs.splice(0, orbs.length - 800);
+  if (orbs.length < ORBS && Math.random() < dt * 8) addOrb(Math.random() * W, Math.random() * H, 1);
+  for (const p of players) {
+    if (!p.alive) {
+      if (!p.human) { p.respawn -= dt; if (p.respawn <= 0 && !spawn(p)) p.respawn = 1; }
+      continue;
+    }
+    let sp = p.human ? SPEED : SPEED * 0.9;
+    if (p.human) {
+      const k = (keys.r ? 1 : 0) - (keys.l ? 1 : 0);
+      if (k) { p.a += k * OMEGA * dt; p.target = p.a; }
+      if (boosting && p.energy > 0) { sp = BOOST; p.energy = Math.max(0, p.energy - dt * 0.45); }
+      else p.energy = Math.min(1, p.energy + dt * 0.2);
+    } else ai(p, dt);
+    const n = Math.max(1, Math.ceil(sp * dt / 0.15));
+    for (let i = 0; i < n && p.alive; i++) advance(p, dt / n, sp);
+  }
+}
+
+function recount() {
+  counts = new Array(players.length + 1).fill(0);
+  for (let i = 0; i < N; i++) if (owner[i]) counts[owner[i]]++;
+  if (state === 'play' && counts[1] === N) endGame(true);
+}
+
+// ---------- flow ----------
+const ov = document.getElementById('ov'), msg = document.getElementById('msg'), go = document.getElementById('go');
+function startGame() {
+  owner.fill(0); trailG.fill(0); orbs.length = 0; fillOrbs();
+  players = []; for (let i = 1; i <= BOTS + 1; i++) players.push(makePlayer(i));
+  me = players[0]; players.forEach(spawn);
+  cam.x = me.x; cam.y = me.y; state = 'play'; recount();
+  ov.style.display = 'none';
+}
+function endGame(win) {
+  state = win ? 'win' : 'over';
+  const pct = (counts[1] / N * 100).toFixed(1);
+  msg.textContent = win ? 'You own the whole map. Paper champion!' : `Game over. You had ${pct}% and ${me.kills} kills.`;
+  go.textContent = 'Play again';
+  setTimeout(() => ov.style.display = 'flex', win ? 600 : 900);
+}
+go.onclick = startGame;
+
+// ---------- input ----------
+const keys = { l: false, r: false };
+function setKey(e, v) {
+  if (e.code === 'Space') { boosting = v; e.preventDefault(); }
+  else if (e.key === 'ArrowLeft' || e.key.toLowerCase() === 'a') keys.l = v;
+  else if (e.key === 'ArrowRight' || e.key.toLowerCase() === 'd') keys.r = v;
+}
+addEventListener('keydown', e => { setKey(e, true); if (e.key === 'Enter' && state !== 'play') startGame(); });
+addEventListener('keyup', e => setKey(e, false));
+function aim(x, y) { if (me && me.alive) { me.target = Math.atan2(y - vh / 2, x - vw / 2); me.rate = OMEGA; } }
+cv.addEventListener('mousemove', e => aim(e.clientX, e.clientY));
+cv.addEventListener('mousedown', () => boosting = true);
+addEventListener('mouseup', () => boosting = false);
+cv.addEventListener('touchstart', e => aim(e.touches[0].clientX, e.touches[0].clientY));
+cv.addEventListener('touchmove', e => aim(e.touches[0].clientX, e.touches[0].clientY));
+const bst = document.getElementById('bst');
+bst.addEventListener('pointerdown', () => boosting = true);
+bst.addEventListener('pointerup', () => boosting = false);
+bst.addEventListener('pointercancel', () => boosting = false);
+
+// ---------- rendering ----------
+const pctEl = document.getElementById('pct'), subEl = document.getElementById('sub'),
+      lbEl = document.getElementById('lb'), enEl = document.getElementById('en');
+
+
+function drawMini() {
+  mctx.clearRect(0, 0, W, H);
+  for (let i = 0; i < N; i++) if (owner[i]) {
+    mctx.fillStyle = players[owner[i] - 1].solid;
+    mctx.fillRect(i % W, (i / W) | 0, 1, 1);
+  }
+}
+
+function updateHud() {
+  const pct = counts[1] / N * 100;
+  pctEl.textContent = pct.toFixed(1) + '%';
+  subEl.textContent = `Orbs: ${me.score}   Kills: ${me.kills}`;
+  const top = players.map(p => [p, counts[p.id]]).sort((a, b) => b[1] - a[1]).slice(0, 5);
+  lbEl.innerHTML = top.map(([p, c]) =>
+    `<div><b style="background:${p.solid}"></b>${p.name} ${(c / N * 100).toFixed(1)}%</div>`).join('');
+}
+
+function draw() {
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = '#0b0d14'; ctx.fillRect(0, 0, vw, vh);
+  if (!me) return;
+  const mx = me.x, my = me.y;
+  if (me.alive) { cam.x += (mx - cam.x) * 0.2; cam.y += (my - cam.y) * 0.2; }
+
+  ctx.save();
+  ctx.translate(vw / 2 - cam.x * S, vh / 2 - cam.y * S);
+  ctx.fillStyle = '#1d2130'; ctx.fillRect(0, 0, W * S, H * S);
+
+  const x0 = Math.max(0, Math.floor(cam.x - vw / 2 / S) - 1), x1 = Math.min(W, Math.ceil(cam.x + vw / 2 / S) + 2);
+  const y0 = Math.max(0, Math.floor(cam.y - vh / 2 / S) - 1), y1 = Math.min(H, Math.ceil(cam.y + vh / 2 / S) + 2);
+
+  ctx.strokeStyle = 'rgba(255,255,255,.045)'; ctx.lineWidth = 1; ctx.beginPath();
+  for (let x = x0; x <= x1; x++) { ctx.moveTo(x * S, y0 * S); ctx.lineTo(x * S, y1 * S); }
+  for (let y = y0; y <= y1; y++) { ctx.moveTo(x0 * S, y * S); ctx.lineTo(x1 * S, y * S); }
+  ctx.stroke();
+
+  for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) {
+    const o = owner[y * W + x];
+    if (o) { ctx.fillStyle = players[o - 1].fill; ctx.fillRect(x * S, y * S, S, S); }
+  }
+
+  for (const o of orbs) {
+    if (o.x < x0 || o.x > x1 || o.y < y0 || o.y > y1) continue;
+    ctx.fillStyle = `hsl(${o.h},90%,65%)`; ctx.beginPath();
+    ctx.arc(o.x * S, o.y * S, S * (o.v > 1 ? .22 : .15), 0, 7); ctx.fill();
+  }
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  for (const p of players) {
+    if (!p.alive || !p.trail.length) continue;
+    ctx.strokeStyle = p.line; ctx.globalAlpha = .65; ctx.setLineDash([S * .3, S * .3]); ctx.lineWidth = S * 0.22;
+    ctx.beginPath(); ctx.moveTo(p.trail[0][0] * S, p.trail[0][1] * S);
+    for (let i = 1; i < p.trail.length; i++) ctx.lineTo(p.trail[i][0] * S, p.trail[i][1] * S);
+    ctx.lineTo(p.x * S, p.y * S); ctx.stroke();
+  }
+  ctx.globalAlpha = 1; ctx.setLineDash([]);
+  for (const p of players) {                                 // physical snake bodies
+    if (!p.alive || !p.hist.length) continue;
+    const w = S * 0.95 * p.size;
+    for (const [col, lw] of [[p.line, w], [p.solid, w * 0.7]]) {
+      ctx.strokeStyle = col; ctx.lineWidth = lw; ctx.beginPath();
+      ctx.moveTo(p.hist[0][0] * S, p.hist[0][1] * S);
+      for (let i = 1; i < p.hist.length; i++) ctx.lineTo(p.hist[i][0] * S, p.hist[i][1] * S);
+      ctx.lineTo(p.x * S, p.y * S); ctx.stroke();
+    }
+  }
+
+  for (const p of players) {
+    if (!p.alive) continue;
+    const cx = p.x * S, cy = p.y * S, fx = Math.cos(p.a), fy = Math.sin(p.a);
+    ctx.fillStyle = p.line; ctx.strokeStyle = '#fff'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(cx, cy, S * 0.52 * p.size, 0, 7); ctx.fill(); ctx.stroke();
+    for (const k of [-1, 1]) {                                 // eyes follow the heading
+      const e = 5 * p.size, ex = cx + fx * e - fy * k * e, ey = cy + fy * e + fx * k * e;
+      ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(ex, ey, 3.6 * p.size, 0, 7); ctx.fill();
+      ctx.fillStyle = '#111'; ctx.beginPath(); ctx.arc(ex + fx * 1.4, ey + fy * 1.4, 1.7 * p.size, 0, 7); ctx.fill();
+    }
+    ctx.fillStyle = '#fff'; ctx.font = '600 12px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText(p.name, cx, cy - S * 0.8 * p.size);
+  }
+  ctx.strokeStyle = '#ff5c6c'; ctx.lineWidth = 6; ctx.strokeRect(0, 0, W * S, H * S);
+  ctx.restore();
+
+  // minimap
+  if (frame % 8 === 0) drawMini();
+  const mw = Math.min(120, vw * 0.3), mx0 = vw - mw - 12, my0 = 12;
+  ctx.fillStyle = 'rgba(0,0,0,.45)'; ctx.fillRect(mx0, my0, mw, mw);
+  ctx.imageSmoothingEnabled = false; ctx.drawImage(mini, mx0, my0, mw, mw);
+  ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5;
+  ctx.strokeRect(mx0 + (cam.x - vw / 2 / S) / W * mw, my0 + (cam.y - vh / 2 / S) / H * mw, vw / S / W * mw, vh / S / H * mw);
+  ctx.strokeRect(mx0, my0, mw, mw);
+}
+
+function loop(t) {
+  const dt = Math.min(0.05, (t - last) / 1000 || 0); last = t; frame++;
+  if (players.length) {
+    update(dt);
+    if (frame % 6 === 0) { recount(); updateHud(); }
+    enEl.style.width = (me.energy * 100) + '%';
+  }
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
